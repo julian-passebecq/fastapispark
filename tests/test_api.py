@@ -25,6 +25,8 @@ def test_real_spark_capability_is_explicit_when_unconfigured():
     assert r.status_code==200
     body=r.json()
     assert body["mode"]=="github_actions_ephemeral"
+    assert body["runner_api_version"]==2
+    assert body["provider"]=="github_actions"
     assert body["spark_version"]=="4.2.0"
     assert body["master"]=="local[4]"
     assert body["cluster_truth"].startswith("single-host Spark")
@@ -50,3 +52,13 @@ def test_real_spark_verify_accepts_one_level_schema_table_names():
         collect_limit=10,
     )
     assert req.tables[0].name=="silver.orders"
+
+
+def test_provider_neutral_job_routes_require_server_key(monkeypatch):
+    monkeypatch.delenv("DATAPASS_RUNNER_KEY", raising=False)
+    r=client.get("/v1/spark/jobs/github:42")
+    assert r.status_code==503
+
+    monkeypatch.setenv("DATAPASS_RUNNER_KEY","server-secret")
+    r=client.get("/v1/spark/jobs/not-a-job",headers={"X-Datapass-Runner-Key":"server-secret"})
+    assert r.status_code==404
