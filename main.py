@@ -13,6 +13,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from real_spark import RealSparkOracle
+
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FORBIDDEN_SQL = re.compile(
     r"\b(attach|copy|export|import|install|load|pragma|call|create|drop|alter|delete|update|insert|"
@@ -81,6 +83,18 @@ class SqlRequest(BaseModel):
     tables: list[TableData] = Field(default_factory=list, max_length=8)
     collect_limit: int = Field(default=100, ge=1, le=500)
     hints: SimulationHints = Field(default_factory=SimulationHints)
+
+class VerifyRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=20_000)
+    tables: list[TableData] = Field(default_factory=list, max_length=8)
+    collect_limit: int = Field(default=100, ge=1, le=200)
+
+    @model_validator(mode="after")
+    def bounded_fixture(self):
+        if sum(len(table.rows) for table in self.tables) > 5000:
+            raise ValueError("Real Spark verification allows at most 5000 fixture rows total")
+        return self
+
 
 RUNTIMES = {
     "datapass-free": dict(label="Datapass Free Lab", executors=1, cores=2, memory_gb=1.0, partitions=4, scan=180, shuffle=90, rows_sec=180000, startup=80, credits_hour=0.0),
@@ -310,6 +324,8 @@ def compile_pyspark(code: str):
     if source is None: raise ValueError('Start with a source such as: df = spark.table("sales")')
     return source,ops,warnings
 
+real_spark = RealSparkOracle()
+
 app=FastAPI(
     title="Datapass Fake Spark Runtime",
     version="0.1.0",
@@ -355,6 +371,41 @@ def execute(req: ExecuteRequest):
         raise HTTPException(422,str(e)) from e
     except Exception as e:
         raise HTTPException(400,f"Execution failed: {e}") from e
+
+@app.get("/v1/spark/verify/capabilities")
+def verify_capabilities():
+    return real_spark.capabilities()
+
+@app.post("/v1/spark/verify", status_code=202)
+def verify(req: VerifyRequest):
+    try:
+        return real_spark.dispatch(
+            code=req.code,
+            tables=[table.model_dump(mode="json") for table in req.tables],
+            collect_limit=req.collect_limit,
+        )
+    except ValueError as e:
+        raise HTTPException(422,str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(503,str(e)) from e
+
+@app.get("/v1/spark/verify/{run_id}")
+def verify_status(run_id: int):
+    try:
+        return real_spark.status(run_id)
+    except ValueError as e:
+        raise HTTPException(404,str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(503,str(e)) from e
+
+@app.get("/v1/spark/verify/{run_id}/result/{request_id}")
+def verify_result(run_id: int, request_id: str):
+    try:
+        return real_spark.result(run_id, request_id)
+    except ValueError as e:
+        raise HTTPException(404,str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(503,str(e)) from e
 
 @app.post("/v1/spark/sql")
 def spark_sql(req: SqlRequest):
