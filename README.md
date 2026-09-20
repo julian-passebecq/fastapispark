@@ -54,14 +54,14 @@ permission for the execution repository:
 
 ```text
 DATAPASS_GITHUB_TOKEN=<server-only token>
+DATAPASS_RUNNER_KEY=<server-to-server secret>
 DATAPASS_SPARK_GITHUB_REPO=julian-passebecq/fastapispark
 DATAPASS_SPARK_GITHUB_WORKFLOW=real-spark.yml
 DATAPASS_SPARK_GITHUB_REF=main
 DATAPASS_SPARK_PUBLIC_REPO=1
 ```
 
-Do not expose that token to the browser. On a public execution repository,
-submitted source, logs and artifacts must contain no secrets or private data.
+Do not expose either secret to the browser. The verify/status/result endpoints require the `X-Datapass-Runner-Key` header; the Datapass backend should add it server-side when proxying to this service. On a public execution repository, submitted source, logs and artifacts must contain no secrets or private data.
 
 ## Runtime profiles
 
