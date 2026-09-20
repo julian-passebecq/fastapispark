@@ -52,6 +52,12 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Cache pinned PySpark download
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: datapass-pyspark-${{ runner.os }}-py312-4.2.0
+
       - name: Configure ephemeral Spark paths
         shell: bash
         run: |
