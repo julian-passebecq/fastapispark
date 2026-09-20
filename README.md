@@ -69,7 +69,8 @@ The API exposes four fictional Datapass profiles: `datapass-free`, `datapass-s`,
 
 ## Safety boundaries
 
-- No `exec()` or `eval()` of notebook Python.
+- The normal FastAPI/DuckDB SparkLab path never `exec()`s or `eval()`s notebook Python; it parses a bounded PySpark-like subset.
+- The optional **real Spark oracle** deliberately executes submitted educational PySpark inside an ephemeral GitHub-hosted VM. That runner is a separate trust boundary: do not submit credentials, private company code or personal/customer data.
 - SQL is restricted to one comment-free `SELECT`/`WITH` query over in-memory tables.
 - DuckDB external access and automatic extension loading are disabled when supported.
 - Input tables are bounded to 5,000 rows each and eight tables per request.
