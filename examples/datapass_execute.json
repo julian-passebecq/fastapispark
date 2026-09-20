@@ -1,0 +1,12 @@
+{
+  "runtime_id": "datapass-s",
+  "source_table": "sales",
+  "tables": [{"name":"sales","rows":[{"region":"NO","amount":180.0},{"region":"NO","amount":80.0},{"region":"CH","amount":240.0}]}],
+  "operations": [
+    {"op":"filter","args":{"condition":"amount > 100"}},
+    {"op":"group_by","args":{"keys":["region"],"aggregations":[{"function":"sum","column":"amount","alias":"revenue"}]}},
+    {"op":"order_by","args":{"columns":[{"column":"revenue","direction":"desc"}]}}
+  ],
+  "hints":{"input_rows":5000000,"input_bytes":900000000,"partitions":32,"skew_factor":1.4},
+  "collect_limit":100
+}
