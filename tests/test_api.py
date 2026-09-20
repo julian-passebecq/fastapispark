@@ -28,3 +28,16 @@ def test_real_spark_capability_is_explicit_when_unconfigured():
     assert body["spark_version"]=="4.2.0"
     assert body["master"]=="local[4]"
     assert body["cluster_truth"].startswith("single-host Spark")
+
+
+def test_real_spark_verify_requires_server_key(monkeypatch):
+    monkeypatch.delenv("DATAPASS_RUNNER_KEY", raising=False)
+    payload={"code":'result = spark.table("sales")',"tables":[{"name":"sales","rows":[{"id":1}]}],"collect_limit":10}
+    r=client.post("/v1/spark/verify",json=payload)
+    assert r.status_code==503
+
+    monkeypatch.setenv("DATAPASS_RUNNER_KEY","server-secret")
+    r=client.post("/v1/spark/verify",json=payload)
+    assert r.status_code==401
+    r=client.post("/v1/spark/verify",json=payload,headers={"X-Datapass-Runner-Key":"server-secret"})
+    assert r.status_code==503  # GitHub token is intentionally not configured in unit tests.
