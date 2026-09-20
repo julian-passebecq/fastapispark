@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import math
 import os
@@ -9,7 +10,7 @@ from enum import Enum
 from typing import Any
 
 import duckdb
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -94,6 +95,14 @@ class VerifyRequest(BaseModel):
         if sum(len(table.rows) for table in self.tables) > 5000:
             raise ValueError("Real Spark verification allows at most 5000 fixture rows total")
         return self
+
+
+def require_runner_key(x_datapass_runner_key: str | None = Header(default=None)):
+    expected = os.getenv("DATAPASS_RUNNER_KEY")
+    if not expected:
+        raise HTTPException(503, "Real Spark verification is disabled until DATAPASS_RUNNER_KEY is configured.")
+    if not x_datapass_runner_key or not hmac.compare_digest(x_datapass_runner_key, expected):
+        raise HTTPException(401, "Invalid Datapass runner key.")
 
 
 RUNTIMES = {
@@ -377,7 +386,7 @@ def verify_capabilities():
     return real_spark.capabilities()
 
 @app.post("/v1/spark/verify", status_code=202)
-def verify(req: VerifyRequest):
+def verify(req: VerifyRequest, _: None = Depends(require_runner_key)):
     try:
         return real_spark.dispatch(
             code=req.code,
@@ -390,7 +399,7 @@ def verify(req: VerifyRequest):
         raise HTTPException(503,str(e)) from e
 
 @app.get("/v1/spark/verify/{run_id}")
-def verify_status(run_id: int):
+def verify_status(run_id: int, _: None = Depends(require_runner_key)):
     try:
         return real_spark.status(run_id)
     except ValueError as e:
@@ -399,7 +408,7 @@ def verify_status(run_id: int):
         raise HTTPException(503,str(e)) from e
 
 @app.get("/v1/spark/verify/{run_id}/result/{request_id}")
-def verify_result(run_id: int, request_id: str):
+def verify_result(run_id: int, request_id: str, _: None = Depends(require_runner_key)):
     try:
         return real_spark.result(run_id, request_id)
     except ValueError as e:
