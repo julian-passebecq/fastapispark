@@ -90,6 +90,28 @@ uv run pytest
 
 The repository is structured for FastAPI Cloud with a root `main.py` exposing `app` and a `pyproject.toml` declaring all runtime dependencies.
 
+### Real Spark runner contract
+
+The public API now exposes provider-neutral job identifiers in addition to the
+legacy GitHub Actions run id. A dispatch returns both:
+
+```json
+{"job_id":"github:123456789","run_id":123456789}
+```
+
+Poll the stable runner contract with:
+
+```text
+GET /v1/spark/jobs/{job_id}
+GET /v1/spark/jobs/{job_id}/result/{request_id}
+```
+
+Today `github:` jobs execute on GitHub Actions. The identifier and endpoint
+shape deliberately do not force Datapass clients to know that implementation,
+so a persistent Oracle A1 Spark backend can be added later without replacing
+the notebook/UI contract. The legacy `/v1/spark/verify/{run_id}` routes remain
+available during migration.
+
 ```bash
 uv run fastapi cloud deploy . --json
 ```
