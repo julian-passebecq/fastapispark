@@ -86,7 +86,25 @@ class SqlRequest(BaseModel):
     hints: SimulationHints = Field(default_factory=SimulationHints)
 
 class VerifyTableData(BaseModel):
-    name: str = Field(min_length=1, max_length=129, pattern=r'^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?    collect_limit: int = Field(default=100, ge=1, le=200)
+    name: str = Field(
+        min_length=1,
+        max_length=129,
+        pattern=r'^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$',
+    )
+    rows: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
+
+    @field_validator("rows")
+    @classmethod
+    def validate_rows(cls, rows):
+        if any(len(row) > 100 for row in rows):
+            raise ValueError("Each row may contain at most 100 columns")
+        return rows
+
+
+class VerifyRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=20_000)
+    tables: list[VerifyTableData] = Field(default_factory=list, max_length=8)
+    collect_limit: int = Field(default=100, ge=1, le=200)
 
     @model_validator(mode="after")
     def bounded_fixture(self):
