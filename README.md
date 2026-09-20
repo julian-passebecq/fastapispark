@@ -26,6 +26,43 @@ This gives the React/Fluent notebook UI enough information to render a Fabric/Da
 
 Interactive OpenAPI documentation is at `/docs`.
 
+## Real Spark verification
+
+SparkLab remains the default interactive path. It uses DuckDB for bounded real
+results and a deterministic model for distributed Spark concepts.
+
+For an explicit oracle run, Datapass can dispatch the same educational source
+and bounded fixtures to GitHub Actions, where Apache Spark **4.2.0** runs in
+`local[4]` mode on one GitHub-hosted Ubuntu VM.
+
+This is genuine Spark execution, but it is **single-host**, not a multi-machine
+cluster.
+
+Remote endpoints:
+
+- `GET /v1/spark/verify/capabilities`
+- `POST /v1/spark/verify`
+- `GET /v1/spark/verify/{run_id}`
+- `GET /v1/spark/verify/{run_id}/result/{request_id}`
+
+The verification artifact includes bounded result rows, Spark logical and
+physical plans, formatted explain output, the Spark event log, and measured
+task/stage/shuffle/spill summaries.
+
+The FastAPI server needs a server-side GitHub token with Actions write/read
+permission for the execution repository:
+
+```text
+DATAPASS_GITHUB_TOKEN=<server-only token>
+DATAPASS_SPARK_GITHUB_REPO=julian-passebecq/fastapispark
+DATAPASS_SPARK_GITHUB_WORKFLOW=real-spark.yml
+DATAPASS_SPARK_GITHUB_REF=main
+DATAPASS_SPARK_PUBLIC_REPO=1
+```
+
+Do not expose that token to the browser. On a public execution repository,
+submitted source, logs and artifacts must contain no secrets or private data.
+
 ## Runtime profiles
 
 The API exposes four fictional Datapass profiles: `datapass-free`, `datapass-s`, `datapass-m`, and `datapass-l`. These are educational parameters, not Microsoft Fabric, Databricks or cloud-provider prices.
