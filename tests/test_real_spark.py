@@ -55,8 +55,12 @@ def test_capabilities_are_truthful_when_unconfigured():
     ).capabilities()
 
     assert capability["enabled"] is False
+    assert capability["runner_api_version"] == 2
+    assert capability["provider"] == "github_actions"
+    assert capability["lifecycle"] == "ephemeral"
     assert capability["spark_version"] == "4.2.0"
     assert capability["master"] == "local[4]"
+    assert capability["job_id_scheme"] == "github:<workflow_run_id>"
     assert "single-host" in capability["cluster_truth"]
     assert "no secrets" in capability["privacy"].lower()
 
@@ -88,6 +92,7 @@ def test_dispatch_requests_exact_run_details_and_bounds_payload(monkeypatch):
     )
 
     assert result["run_id"] == 42
+    assert result["job_id"] == "github:42"
     method, url, kwargs = calls[0]
     assert method == "POST"
     assert url.endswith("/actions/workflows/real-spark.yml/dispatches")
@@ -127,6 +132,13 @@ def test_status_reads_exact_workflow_run(monkeypatch):
     status = RealSparkOracle(configured()).status(77)
     assert status["artifact_available"] is True
     assert status["conclusion"] == "success"
+    assert status["job_id"] == "github:77"
+
+    status_from_job = RealSparkOracle(configured()).status_job("github:77")
+    assert status_from_job["run_id"] == 77
+
+    with pytest.raises(ValueError, match="job id"):
+        RealSparkOracle(configured()).status_job("oracle:77")
 
 
 def test_result_returns_real_spark_evidence(monkeypatch):
@@ -201,6 +213,7 @@ def test_result_returns_real_spark_evidence(monkeypatch):
 
     result = oracle.result(88, request_id)
     assert result["status"] == "success"
+    assert result["job_id"] == "github:88"
     assert result["spark_version"] == "4.2.0"
     assert result["master"] == "local[4]"
     assert result["wall_elapsed_ms"] == 1234.5
