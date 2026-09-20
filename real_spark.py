@@ -25,8 +25,10 @@ import httpx
 
 
 API_VERSION = "2026-03-10"
+RUNNER_API_VERSION = 2
 SPARK_VERSION = "4.2.0"
 REQUEST_ID = re.compile(r"^[a-f0-9]{16}$")
+JOB_ID = re.compile(r"^github:[1-9][0-9]{0,18}$")
 MAX_CODE_BYTES = 20_000
 MAX_TABLES_BYTES = 20_000
 MAX_LOG_CHARS = 30_000
@@ -64,10 +66,21 @@ class RealSparkOracle:
         c = self.config
         return {
             "schema_version": 1,
+            "runner_api_version": RUNNER_API_VERSION,
             "enabled": c.configured,
             "mode": "github_actions_ephemeral",
+            "provider": "github_actions",
+            "lifecycle": "ephemeral",
             "spark_version": SPARK_VERSION,
             "master": "local[4]",
+            "job_id_scheme": "github:<workflow_run_id>",
+            "execution_target": {
+                "provider": "github_actions",
+                "lifecycle": "ephemeral",
+                "host_scope": "single_host",
+                "master": "local[4]",
+                "spark_version": SPARK_VERSION,
+            },
             "repo": c.repo,
             "workflow": c.workflow,
             "ref": c.ref,
@@ -139,13 +152,21 @@ class RealSparkOracle:
         run_id = body.get("workflow_run_id")
         if not run_id:
             raise RuntimeError("GitHub accepted the Spark dispatch but returned no workflow run id.")
+        run_id = int(run_id)
         return {
             "request_id": request_id,
             "status": "accepted",
-            "run_id": int(run_id),
+            "job_id": f"github:{run_id}",
+            "run_id": run_id,
             "run_url": body.get("html_url"),
             "truth": "GitHub Actions accepted a real Spark verification job; Spark has not completed yet",
         }
+
+    @staticmethod
+    def _run_id_from_job_id(job_id: str) -> int:
+        if not JOB_ID.fullmatch(job_id):
+            raise ValueError("Invalid Spark runner job id.")
+        return int(job_id.split(":", 1)[1])
 
     def _run(self, run_id: int) -> dict[str, Any]:
         if run_id <= 0:
@@ -160,10 +181,12 @@ class RealSparkOracle:
 
     def status(self, run_id: int) -> dict[str, Any]:
         run = self._run(run_id)
+        resolved_run_id = int(run.get("id") or run_id)
         return {
             "status": run.get("status"),
             "conclusion": run.get("conclusion"),
-            "run_id": run.get("id"),
+            "job_id": f"github:{resolved_run_id}",
+            "run_id": resolved_run_id,
             "run_url": run.get("html_url"),
             "created_at": run.get("created_at"),
             "run_started_at": run.get("run_started_at"),
@@ -171,6 +194,12 @@ class RealSparkOracle:
             "artifact_available": run.get("status") == "completed",
             "truth": "real GitHub Actions workflow state",
         }
+
+    def status_job(self, job_id: str) -> dict[str, Any]:
+        return self.status(self._run_id_from_job_id(job_id))
+
+    def result_job(self, job_id: str, request_id: str) -> dict[str, Any]:
+        return self.result(self._run_id_from_job_id(job_id), request_id)
 
     def result(self, run_id: int, request_id: str) -> dict[str, Any]:
         if not REQUEST_ID.fullmatch(request_id):
@@ -217,6 +246,7 @@ class RealSparkOracle:
             result["log_truncated"] = len(stdout) > MAX_LOG_CHARS
 
         result["request_id"] = request_id
+        result["job_id"] = f"github:{run_id}"
         result["run_id"] = run_id
         result["run_url"] = run.get("html_url")
         result["truth"] = (
