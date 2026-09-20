@@ -18,3 +18,13 @@ def test_compile_common_subset():
 def test_wide_stage_shuffle():
     m=simulate("datapass-s","sales",[Operation(op="group_by",args={"keys":["region"],"aggregations":[{"function":"sum","column":"amount","alias":"revenue"}]})],[],SimulationHints(input_rows=5_000_000,input_bytes=900_000_000,partitions=32,skew_factor=1.5))
     assert m["total_shuffle_bytes"]>0 and m["stages"]
+
+
+def test_real_spark_capability_is_explicit_when_unconfigured():
+    r=client.get("/v1/spark/verify/capabilities")
+    assert r.status_code==200
+    body=r.json()
+    assert body["mode"]=="github_actions_ephemeral"
+    assert body["spark_version"]=="4.2.0"
+    assert body["master"]=="local[4]"
+    assert body["cluster_truth"].startswith("single-host Spark")
