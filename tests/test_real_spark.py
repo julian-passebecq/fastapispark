@@ -145,6 +145,7 @@ def test_result_returns_real_spark_evidence(monkeypatch):
                     "runner": "github-hosted-ubuntu",
                     "execution_mode": "real Spark local[4]",
                     "multi_machine_cluster": False,
+                    "wall_elapsed_ms": 1234.5,
                     "rows": [{"country": "NO", "revenue": 30}],
                     "columns": ["country", "revenue"],
                     "total_rows": 1,
@@ -202,6 +203,7 @@ def test_result_returns_real_spark_evidence(monkeypatch):
     assert result["status"] == "success"
     assert result["spark_version"] == "4.2.0"
     assert result["master"] == "local[4]"
+    assert result["wall_elapsed_ms"] == 1234.5
     assert result["metrics"]["task_count"] == 8
     assert "HashAggregate" in result["physical_plan"]
     assert result["log"] == "real spark log\n"
