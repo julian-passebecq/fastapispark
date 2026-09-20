@@ -82,6 +82,7 @@ jobs:
           import base64
           import json
           import os
+          import re
           from pathlib import Path
 
           root = Path(os.environ["DATAPASS_SPARK_HOME"])
@@ -126,9 +127,12 @@ jobs:
               raise SystemExit("Spark fixture must contain at most eight tables")
 
           total_rows = 0
+          table_name = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
           for table in tables:
               if not isinstance(table, dict) or not isinstance(table.get("name"), str):
                   raise SystemExit("Invalid table fixture")
+              if not table_name.fullmatch(table["name"]):
+                  raise SystemExit("Table names must be simple identifiers or schema.table")
               rows = table.get("rows", [])
               if not isinstance(rows, list):
                   raise SystemExit("Invalid table rows")
@@ -196,7 +200,13 @@ jobs:
                   if not rows:
                       raise ValueError(f"Table {table['name']!r} is empty; Pass 1 requires non-empty fixtures.")
                   frame = spark.createDataFrame(rows)
-                  frame.createOrReplaceTempView(table["name"])
+                  name = table["name"]
+                  if "." in name:
+                      schema, relation = name.split(".", 1)
+                      spark.sql(f"CREATE DATABASE IF NOT EXISTS `{schema}`")
+                      frame.write.mode("overwrite").saveAsTable(f"`{schema}`.`{relation}`")
+                  else:
+                      frame.createOrReplaceTempView(name)
 
               source = (root / "learner.py").read_text(encoding="utf-8")
               namespace = {
