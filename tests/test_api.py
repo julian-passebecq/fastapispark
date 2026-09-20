@@ -1,5 +1,5 @@
 from fastapi.testclient import TestClient
-from main import app, compile_pyspark, Operation, SimulationHints, simulate
+from main import app, compile_pyspark, Operation, SimulationHints, VerifyRequest, simulate
 
 client = TestClient(app)
 
@@ -41,3 +41,12 @@ def test_real_spark_verify_requires_server_key(monkeypatch):
     assert r.status_code==401
     r=client.post("/v1/spark/verify",json=payload,headers={"X-Datapass-Runner-Key":"server-secret"})
     assert r.status_code==503  # GitHub token is intentionally not configured in unit tests.
+
+
+def test_real_spark_verify_accepts_one_level_schema_table_names():
+    req=VerifyRequest(
+        code='result = spark.table("silver.orders")',
+        tables=[{"name":"silver.orders","rows":[{"order_id":"O-1","amount":10}]}],
+        collect_limit=10,
+    )
+    assert req.tables[0].name=="silver.orders"
