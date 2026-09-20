@@ -234,15 +234,23 @@ jobs:
                   result.explain(mode="formatted")
               (root / "formatted-plan.txt").write_text(formatted.getvalue(), encoding="utf-8")
 
-              total_rows = result.count()
+              # One bounded notebook-preview action only. Calling count() first
+              # would trigger a second Spark job and distort stage/task metrics.
               encoded_rows = result.limit(collect_limit + 1).toJSON().collect()
+              truncated = len(encoded_rows) > collect_limit
               decoded_rows = [json.loads(item) for item in encoded_rows[:collect_limit]]
               result_payload.update(
                   status="success",
                   columns=result.columns,
                   rows=decoded_rows,
-                  total_rows=total_rows,
-                  truncated=total_rows > collect_limit,
+                  total_rows=None if truncated else len(decoded_rows),
+                  truncated=truncated,
+                  row_count_truth=(
+                      "exact because the bounded preview exhausted the result"
+                      if not truncated
+                      else "unknown beyond collect_limit; no hidden count action was executed"
+                  ),
+                  action="bounded notebook preview",
               )
           except Exception as error:
               result_payload["error_type"] = type(error).__name__
