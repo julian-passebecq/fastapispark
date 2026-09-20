@@ -1,0 +1,408 @@
+name: Datapass real Spark oracle
+
+on:
+  push:
+    branches:
+      - codex/real-spark-github-actions-1
+    paths:
+      - .github/workflows/real-spark.yml
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: Datapass verification request id
+        required: true
+        type: string
+      code_b64:
+        description: Base64 encoded PySpark learner source
+        required: true
+        type: string
+      tables_b64:
+        description: Base64 encoded bounded table fixtures JSON
+        required: true
+        type: string
+      collect_limit:
+        description: Maximum result rows returned to Datapass
+        required: true
+        default: "100"
+        type: string
+
+# Learner code is arbitrary educational code. Do not check out repository
+# contents and do not expose repository secrets or GitHub credentials.
+permissions:
+  contents: read
+
+jobs:
+  real-spark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SPARK_VERSION: "4.2.0"
+      REQUEST_ID_INPUT: ${{ inputs.request_id }}
+      CODE_B64_INPUT: ${{ inputs.code_b64 }}
+      TABLES_B64_INPUT: ${{ inputs.tables_b64 }}
+      COLLECT_LIMIT_INPUT: ${{ inputs.collect_limit }}
+
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pinned PySpark download
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: datapass-pyspark-${{ runner.os }}-py312-4.2.0
+
+      - name: Configure ephemeral Spark paths
+        shell: bash
+        run: |
+          echo "DATAPASS_SPARK_HOME=${RUNNER_TEMP}/datapass-real-spark" >> "${GITHUB_ENV}"
+          echo "SPARK_LOCAL_DIRS=${RUNNER_TEMP}/spark-local" >> "${GITHUB_ENV}"
+
+      - name: Install pinned PySpark
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install "pyspark==${SPARK_VERSION}"
+          python -m pip check
+          python - <<'PY'
+          import pyspark
+          assert pyspark.__version__ == "4.2.0", pyspark.__version__
+          print("PySpark", pyspark.__version__)
+          PY
+          java -version
+
+      - name: Prepare bounded verification payload
+        id: prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${DATAPASS_SPARK_HOME}/event-log" "${SPARK_LOCAL_DIRS}"
+          python - <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          root = Path(os.environ["DATAPASS_SPARK_HOME"])
+          dispatched = bool(os.environ.get("CODE_B64_INPUT"))
+          request_id = os.environ.get("REQUEST_ID_INPUT") or f"ci-{os.environ['GITHUB_RUN_ID']}"
+          collect_limit = int(os.environ.get("COLLECT_LIMIT_INPUT") or "100")
+          if not 1 <= collect_limit <= 200:
+              raise SystemExit("collect_limit must be 1..200")
+
+          if dispatched:
+              code = base64.b64decode(os.environ["CODE_B64_INPUT"], validate=True).decode("utf-8")
+              tables_raw = base64.b64decode(os.environ["TABLES_B64_INPUT"], validate=True)
+              tables = json.loads(tables_raw)
+          else:
+              code = """result = (
+              spark.table("sales")
+              .filter(F.col("amount") > 10)
+              .groupBy("country")
+              .agg(F.sum("amount").alias("revenue"))
+              .orderBy("country")
+          )
+          """
+              tables = [
+                  {
+                      "name": "sales",
+                      "rows": [
+                          {"country": "CH", "amount": 10},
+                          {"country": "CH", "amount": 25},
+                          {"country": "NO", "amount": 30},
+                          {"country": "NO", "amount": 5}
+                      ]
+                  }
+              ]
+
+          code_bytes = code.encode("utf-8")
+          tables_bytes = json.dumps(tables, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+          if not code_bytes or len(code_bytes) > 20000:
+              raise SystemExit("Spark code must be 1..20000 UTF-8 bytes")
+          if len(tables_bytes) > 20000:
+              raise SystemExit("Spark fixture JSON exceeds 20000 bytes")
+          if not isinstance(tables, list) or len(tables) > 8:
+              raise SystemExit("Spark fixture must contain at most eight tables")
+
+          total_rows = 0
+          table_name = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
+          for table in tables:
+              if not isinstance(table, dict) or not isinstance(table.get("name"), str):
+                  raise SystemExit("Invalid table fixture")
+              if not table_name.fullmatch(table["name"]):
+                  raise SystemExit("Table names must be simple identifiers or schema.table")
+              rows = table.get("rows", [])
+              if not isinstance(rows, list):
+                  raise SystemExit("Invalid table rows")
+              total_rows += len(rows)
+          if total_rows > 5000:
+              raise SystemExit("Remote Spark verification allows at most 5000 fixture rows total")
+
+          (root / "learner.py").write_text(code, encoding="utf-8")
+          (root / "tables.json").write_text(json.dumps(tables), encoding="utf-8")
+          output = Path(os.environ["GITHUB_OUTPUT"])
+          with output.open("a", encoding="utf-8") as handle:
+              handle.write(f"request_id={request_id}\n")
+              handle.write(f"collect_limit={collect_limit}\n")
+          PY
+
+      - name: Write isolated Spark runner
+        shell: bash
+        run: |
+          cat > "${DATAPASS_SPARK_HOME}/runner.py" <<'PY'
+          from __future__ import annotations
+
+          import contextlib
+          import io
+          import json
+          import os
+          import time
+          from pathlib import Path
+
+          from pyspark.sql import DataFrame, SparkSession, Window, functions as F
+
+          root = Path(os.environ["DATAPASS_SPARK_HOME"])
+          event_dir = root / "event-log"
+          collect_limit = int(os.environ.get("COLLECT_LIMIT", "100"))
+
+          spark = (
+              SparkSession.builder
+              .master("local[4]")
+              .appName("datapass-real-spark")
+              .config("spark.ui.enabled", "false")
+              .config("spark.sql.shuffle.partitions", "4")
+              .config("spark.eventLog.enabled", "true")
+              .config("spark.eventLog.compress", "false")
+              .config("spark.eventLog.dir", f"file://{event_dir}")
+              .getOrCreate()
+          )
+          spark.sparkContext.setLogLevel("WARN")
+
+          started = time.perf_counter()
+          result_payload = {
+              "schema_version": 1,
+              "status": "failed",
+              "spark_version": spark.version,
+              "master": spark.sparkContext.master,
+              "runner": "github-hosted-ubuntu",
+              "execution_mode": "real Spark local[4]",
+              "multi_machine_cluster": False,
+              "rows": [],
+              "columns": [],
+              "total_rows": None,
+              "truncated": False,
+          }
+
+          try:
+              tables = json.loads((root / "tables.json").read_text(encoding="utf-8"))
+              for table in tables:
+                  rows = table.get("rows", [])
+                  if not rows:
+                      raise ValueError(f"Table {table['name']!r} is empty; Pass 1 requires non-empty fixtures.")
+                  frame = spark.createDataFrame(rows)
+                  name = table["name"]
+                  if "." in name:
+                      schema, relation = name.split(".", 1)
+                      spark.sql(f"CREATE DATABASE IF NOT EXISTS `{schema}`")
+                      frame.write.mode("overwrite").saveAsTable(f"`{schema}`.`{relation}`")
+                  else:
+                      frame.createOrReplaceTempView(name)
+
+              source = (root / "learner.py").read_text(encoding="utf-8")
+              namespace = {
+                  "spark": spark,
+                  "F": F,
+                  "Window": Window,
+              }
+              exec(compile(source, "learner.py", "exec"), namespace, namespace)
+              result = namespace.get("result")
+              if not isinstance(result, DataFrame):
+                  raise TypeError("Learner source must assign a PySpark DataFrame to variable 'result'.")
+
+              (root / "logical-plan.txt").write_text(
+                  result._jdf.queryExecution().logical().toString(),
+                  encoding="utf-8",
+              )
+              (root / "physical-plan.txt").write_text(
+                  result._jdf.queryExecution().executedPlan().toString(),
+                  encoding="utf-8",
+              )
+              formatted = io.StringIO()
+              with contextlib.redirect_stdout(formatted):
+                  result.explain(mode="formatted")
+              (root / "formatted-plan.txt").write_text(formatted.getvalue(), encoding="utf-8")
+
+              # One bounded notebook-preview action only. Calling count() first
+              # would trigger a second Spark job and distort stage/task metrics.
+              encoded_rows = result.limit(collect_limit + 1).toJSON().collect()
+              truncated = len(encoded_rows) > collect_limit
+              decoded_rows = [json.loads(item) for item in encoded_rows[:collect_limit]]
+              result_payload.update(
+                  status="success",
+                  columns=result.columns,
+                  rows=decoded_rows,
+                  total_rows=None if truncated else len(decoded_rows),
+                  truncated=truncated,
+                  row_count_truth=(
+                      "exact because the bounded preview exhausted the result"
+                      if not truncated
+                      else "unknown beyond collect_limit; no hidden count action was executed"
+                  ),
+                  action="bounded notebook preview",
+              )
+          except Exception as error:
+              result_payload["error_type"] = type(error).__name__
+              result_payload["error"] = str(error)[:4000]
+              raise
+          finally:
+              result_payload["wall_elapsed_ms"] = round((time.perf_counter() - started) * 1000, 3)
+              (root / "result.json").write_text(
+                  json.dumps(result_payload, indent=2, default=str) + "\n",
+                  encoding="utf-8",
+              )
+              spark.stop()
+          PY
+
+      - name: Execute genuine Spark
+        id: spark
+        shell: bash
+        env:
+          COLLECT_LIMIT: ${{ steps.prepare.outputs.collect_limit }}
+        run: |
+          set +e
+          # Learner code receives no explicit repository token or OIDC token.
+          unset GITHUB_TOKEN ACTIONS_RUNTIME_TOKEN ACTIONS_ID_TOKEN_REQUEST_TOKEN ACTIONS_ID_TOKEN_REQUEST_URL
+          timeout 360s python "${DATAPASS_SPARK_HOME}/runner.py" >"${DATAPASS_SPARK_HOME}/spark-run.log" 2>&1
+          code=$?
+          echo "exit_code=${code}" >> "${GITHUB_OUTPUT}"
+          exit 0
+
+      - name: Extract real Spark event metrics
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from collections import defaultdict
+          from pathlib import Path
+
+          root = Path(os.environ["DATAPASS_SPARK_HOME"])
+          stages = defaultdict(lambda: {
+              "task_count": 0,
+              "input_bytes": 0,
+              "shuffle_read_bytes": 0,
+              "shuffle_write_bytes": 0,
+              "memory_spill_bytes": 0,
+              "disk_spill_bytes": 0,
+              "executor_run_time_ms": 0,
+              "task_duration_ms": 0,
+          })
+          event_count = 0
+          parse_errors = 0
+
+          for path in (root / "event-log").rglob("*"):
+              if not path.is_file():
+                  continue
+              try:
+                  lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+              except OSError:
+                  continue
+              for line in lines:
+                  try:
+                      event = json.loads(line)
+                  except json.JSONDecodeError:
+                      parse_errors += 1
+                      continue
+                  event_count += 1
+                  if event.get("Event") != "SparkListenerTaskEnd":
+                      continue
+                  stage_id = str(event.get("Stage ID", 0))
+                  data = stages[stage_id]
+                  data["task_count"] += 1
+                  metrics = event.get("Task Metrics") or {}
+                  data["executor_run_time_ms"] += int(metrics.get("Executor Run Time") or 0)
+                  data["memory_spill_bytes"] += int(metrics.get("Memory Bytes Spilled") or 0)
+                  data["disk_spill_bytes"] += int(metrics.get("Disk Bytes Spilled") or 0)
+                  input_metrics = metrics.get("Input Metrics") or {}
+                  data["input_bytes"] += int(input_metrics.get("Bytes Read") or 0)
+                  shuffle_read = metrics.get("Shuffle Read Metrics") or {}
+                  data["shuffle_read_bytes"] += (
+                      int(shuffle_read.get("Remote Bytes Read") or 0)
+                      + int(shuffle_read.get("Local Bytes Read") or 0)
+                  )
+                  shuffle_write = metrics.get("Shuffle Write Metrics") or {}
+                  data["shuffle_write_bytes"] += int(shuffle_write.get("Shuffle Bytes Written") or 0)
+                  info = event.get("Task Info") or {}
+                  launch = int(info.get("Launch Time") or 0)
+                  finish = int(info.get("Finish Time") or 0)
+                  data["task_duration_ms"] += max(0, finish - launch)
+
+          summary = {
+              "truth": "measured from Spark event log generated by real Spark local[4]",
+              "event_count": event_count,
+              "parse_errors": parse_errors,
+              "stage_count": len(stages),
+              "task_count": sum(item["task_count"] for item in stages.values()),
+              "input_bytes": sum(item["input_bytes"] for item in stages.values()),
+              "shuffle_read_bytes": sum(item["shuffle_read_bytes"] for item in stages.values()),
+              "shuffle_write_bytes": sum(item["shuffle_write_bytes"] for item in stages.values()),
+              "memory_spill_bytes": sum(item["memory_spill_bytes"] for item in stages.values()),
+              "disk_spill_bytes": sum(item["disk_spill_bytes"] for item in stages.values()),
+              "stages": [
+                  {"stage_id": int(stage_id), **data}
+                  for stage_id, data in sorted(stages.items(), key=lambda item: int(item[0]))
+              ],
+          }
+          (root / "metrics.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+          print("REAL SPARK EVENT METRICS")
+          print(json.dumps(summary, indent=2))
+
+          result_path = root / "result.json"
+          if result_path.exists():
+              result = json.loads(result_path.read_text(encoding="utf-8"))
+          else:
+              result = {
+                  "schema_version": 1,
+                  "status": "failed",
+                  "error": "Spark runner ended before producing result.json",
+              }
+          result["metrics"] = summary
+          result["spark_exit_code"] = int(os.environ.get("SPARK_EXIT_CODE") or "1")
+          result_path.write_text(json.dumps(result, indent=2, default=str) + "\n", encoding="utf-8")
+          PY
+        env:
+          SPARK_EXIT_CODE: ${{ steps.spark.outputs.exit_code }}
+
+      - name: Upload Datapass real Spark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: datapass-real-spark-${{ steps.prepare.outputs.request_id || github.run_id }}
+          path: |
+            ${{ env.DATAPASS_SPARK_HOME }}/result.json
+            ${{ env.DATAPASS_SPARK_HOME }}/metrics.json
+            ${{ env.DATAPASS_SPARK_HOME }}/logical-plan.txt
+            ${{ env.DATAPASS_SPARK_HOME }}/physical-plan.txt
+            ${{ env.DATAPASS_SPARK_HOME }}/formatted-plan.txt
+            ${{ env.DATAPASS_SPARK_HOME }}/spark-run.log
+            ${{ env.DATAPASS_SPARK_HOME }}/event-log/
+          retention-days: 3
+          if-no-files-found: warn
+
+      - name: Propagate Spark result
+        if: always()
+        shell: bash
+        env:
+          SPARK_EXIT_CODE: ${{ steps.spark.outputs.exit_code }}
+        run: |
+          code="${SPARK_EXIT_CODE:-1}"
+          exit "${code}"

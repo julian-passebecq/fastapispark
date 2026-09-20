@@ -1,0 +1,223 @@
+from __future__ import annotations
+
+import io
+import json
+import zipfile
+
+import pytest
+
+from real_spark import RealSparkConfig, RealSparkOracle
+
+
+class Response:
+    def __init__(self, status_code: int, data=None, content: bytes | None = None):
+        self.status_code = status_code
+        self._data = data
+        self.content = content if content is not None else (
+            json.dumps(data).encode("utf-8") if data is not None else b""
+        )
+        self.text = self.content.decode("utf-8", "replace")
+
+    def json(self):
+        return self._data
+
+
+class Client:
+    def __init__(self, handler):
+        self.handler = handler
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def post(self, url, **kwargs):
+        return self.handler("POST", url, kwargs)
+
+    def get(self, url, **kwargs):
+        return self.handler("GET", url, kwargs)
+
+
+def configured() -> RealSparkConfig:
+    return RealSparkConfig(
+        repo="owner/fastapispark",
+        workflow="real-spark.yml",
+        ref="main",
+        token="server-token",
+        public_repo=True,
+    )
+
+
+def test_capabilities_are_truthful_when_unconfigured():
+    capability = RealSparkOracle(
+        RealSparkConfig("owner/repo", "real-spark.yml", "main", None, True)
+    ).capabilities()
+
+    assert capability["enabled"] is False
+    assert capability["runner_api_version"] == 2
+    assert capability["provider"] == "github_actions"
+    assert capability["lifecycle"] == "ephemeral"
+    assert capability["spark_version"] == "4.2.0"
+    assert capability["master"] == "local[4]"
+    assert capability["job_id_scheme"] == "github:<workflow_run_id>"
+    assert "single-host" in capability["cluster_truth"]
+    assert "no secrets" in capability["privacy"].lower()
+
+
+def test_dispatch_requests_exact_run_details_and_bounds_payload(monkeypatch):
+    calls = []
+
+    def handler(method, url, kwargs):
+        calls.append((method, url, kwargs))
+        return Response(
+            200,
+            {
+                "workflow_run_id": 42,
+                "run_url": "https://api.github.com/repos/owner/fastapispark/actions/runs/42",
+                "html_url": "https://github.com/owner/fastapispark/actions/runs/42",
+            },
+        )
+
+    monkeypatch.setattr(
+        "real_spark.httpx.Client",
+        lambda **_: Client(handler),
+    )
+
+    oracle = RealSparkOracle(configured())
+    result = oracle.dispatch(
+        code='result = spark.table("sales")',
+        tables=[{"name": "sales", "rows": [{"id": 1}]}],
+        collect_limit=50,
+    )
+
+    assert result["run_id"] == 42
+    assert result["job_id"] == "github:42"
+    method, url, kwargs = calls[0]
+    assert method == "POST"
+    assert url.endswith("/actions/workflows/real-spark.yml/dispatches")
+    assert kwargs["headers"]["Authorization"] == "Bearer server-token"
+    assert kwargs["json"]["return_run_details"] is True
+    assert kwargs["json"]["inputs"]["collect_limit"] == "50"
+
+    with pytest.raises(ValueError):
+        oracle.dispatch(code="", tables=[], collect_limit=10)
+    with pytest.raises(ValueError):
+        oracle.dispatch(code="x" * 20001, tables=[], collect_limit=10)
+    with pytest.raises(ValueError):
+        oracle.dispatch(code="result = None", tables=[], collect_limit=201)
+
+
+def test_status_reads_exact_workflow_run(monkeypatch):
+    def handler(method, url, kwargs):
+        assert method == "GET"
+        assert url.endswith("/actions/runs/77")
+        return Response(
+            200,
+            {
+                "id": 77,
+                "status": "completed",
+                "conclusion": "success",
+                "html_url": "https://github.com/owner/fastapispark/actions/runs/77",
+                "created_at": "2026-09-20T12:00:00Z",
+                "run_started_at": "2026-09-20T12:00:01Z",
+                "updated_at": "2026-09-20T12:00:20Z",
+            },
+        )
+
+    monkeypatch.setattr(
+        "real_spark.httpx.Client",
+        lambda **_: Client(handler),
+    )
+    status = RealSparkOracle(configured()).status(77)
+    assert status["artifact_available"] is True
+    assert status["conclusion"] == "success"
+    assert status["job_id"] == "github:77"
+
+    status_from_job = RealSparkOracle(configured()).status_job("github:77")
+    assert status_from_job["run_id"] == 77
+
+    with pytest.raises(ValueError, match="job id"):
+        RealSparkOracle(configured()).status_job("oracle:77")
+
+
+def test_result_returns_real_spark_evidence(monkeypatch):
+    request_id = "0123456789abcdef"
+
+    bundle_bytes = io.BytesIO()
+    with zipfile.ZipFile(bundle_bytes, "w") as bundle:
+        bundle.writestr(
+            "result.json",
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "status": "success",
+                    "spark_version": "4.2.0",
+                    "master": "local[4]",
+                    "runner": "github-hosted-ubuntu",
+                    "execution_mode": "real Spark local[4]",
+                    "multi_machine_cluster": False,
+                    "wall_elapsed_ms": 1234.5,
+                    "rows": [{"country": "NO", "revenue": 30}],
+                    "columns": ["country", "revenue"],
+                    "total_rows": 1,
+                    "truncated": False,
+                    "metrics": {
+                        "truth": "measured from Spark event log generated by real Spark local[4]",
+                        "stage_count": 2,
+                        "task_count": 8,
+                        "shuffle_read_bytes": 100,
+                        "shuffle_write_bytes": 200,
+                    },
+                }
+            ),
+        )
+        bundle.writestr("logical-plan.txt", "Aggregate ...")
+        bundle.writestr("physical-plan.txt", "HashAggregate ...")
+        bundle.writestr("formatted-plan.txt", "== Physical Plan ==")
+        bundle.writestr("spark-run.log", "real spark log\n")
+    archive = bundle_bytes.getvalue()
+
+    oracle = RealSparkOracle(configured())
+    monkeypatch.setattr(
+        oracle,
+        "_run",
+        lambda run_id: {
+            "id": run_id,
+            "status": "completed",
+            "html_url": f"https://github.com/owner/fastapispark/actions/runs/{run_id}",
+        },
+    )
+
+    def handler(method, url, kwargs):
+        if url.endswith("/actions/runs/88/artifacts"):
+            return Response(
+                200,
+                {
+                    "artifacts": [
+                        {
+                            "name": f"datapass-real-spark-{request_id}",
+                            "archive_download_url": "https://api.github.test/spark.zip",
+                        }
+                    ]
+                },
+            )
+        if url == "https://api.github.test/spark.zip":
+            return Response(200, content=archive)
+        raise AssertionError(url)
+
+    monkeypatch.setattr(
+        "real_spark.httpx.Client",
+        lambda **_: Client(handler),
+    )
+
+    result = oracle.result(88, request_id)
+    assert result["status"] == "success"
+    assert result["job_id"] == "github:88"
+    assert result["spark_version"] == "4.2.0"
+    assert result["master"] == "local[4]"
+    assert result["wall_elapsed_ms"] == 1234.5
+    assert result["metrics"]["task_count"] == 8
+    assert "HashAggregate" in result["physical_plan"]
+    assert result["log"] == "real spark log\n"
+    assert "real Apache Spark 4.2.0" in result["truth"]
