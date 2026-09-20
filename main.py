@@ -353,7 +353,7 @@ real_spark = RealSparkOracle()
 
 app=FastAPI(
     title="Datapass Fake Spark Runtime",
-    version="0.1.0",
+    version="0.2.0",
     description="DuckDB executes bounded local data while a deterministic model simulates Spark stages, shuffles, partitions, spill, skew and fictional Datapass compute credits."
 )
 origins=[x.strip() for x in os.getenv("DATAPASS_CORS_ORIGINS","*").split(",") if x.strip()]
@@ -414,6 +414,26 @@ def verify(req: VerifyRequest, _: None = Depends(require_runner_key)):
     except RuntimeError as e:
         raise HTTPException(503,str(e)) from e
 
+@app.get("/v1/spark/jobs/{job_id}")
+def verify_job_status(job_id: str, _: None = Depends(require_runner_key)):
+    try:
+        return real_spark.status_job(job_id)
+    except ValueError as e:
+        raise HTTPException(404,str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(503,str(e)) from e
+
+@app.get("/v1/spark/jobs/{job_id}/result/{request_id}")
+def verify_job_result(job_id: str, request_id: str, _: None = Depends(require_runner_key)):
+    try:
+        return real_spark.result_job(job_id, request_id)
+    except ValueError as e:
+        raise HTTPException(404,str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(503,str(e)) from e
+
+# Legacy GitHub-run-id routes remain for existing Datapass clients while the
+# provider-neutral job_id contract rolls out.
 @app.get("/v1/spark/verify/{run_id}")
 def verify_status(run_id: int, _: None = Depends(require_runner_key)):
     try:
