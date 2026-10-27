@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import math
 import os
@@ -9,9 +10,11 @@ from enum import Enum
 from typing import Any
 
 import duckdb
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+from real_spark import RealSparkOracle
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 FORBIDDEN_SQL = re.compile(
@@ -81,6 +84,42 @@ class SqlRequest(BaseModel):
     tables: list[TableData] = Field(default_factory=list, max_length=8)
     collect_limit: int = Field(default=100, ge=1, le=500)
     hints: SimulationHints = Field(default_factory=SimulationHints)
+
+class VerifyTableData(BaseModel):
+    name: str = Field(
+        min_length=1,
+        max_length=129,
+        pattern=r'^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$',
+    )
+    rows: list[dict[str, Any]] = Field(default_factory=list, max_length=5000)
+
+    @field_validator("rows")
+    @classmethod
+    def validate_rows(cls, rows):
+        if any(len(row) > 100 for row in rows):
+            raise ValueError("Each row may contain at most 100 columns")
+        return rows
+
+
+class VerifyRequest(BaseModel):
+    code: str = Field(min_length=1, max_length=20_000)
+    tables: list[VerifyTableData] = Field(default_factory=list, max_length=8)
+    collect_limit: int = Field(default=100, ge=1, le=200)
+
+    @model_validator(mode="after")
+    def bounded_fixture(self):
+        if sum(len(table.rows) for table in self.tables) > 5000:
+            raise ValueError("Real Spark verification allows at most 5000 fixture rows total")
+        return self
+
+
+def require_runner_key(x_datapass_runner_key: str | None = Header(default=None)):
+    expected = os.getenv("DATAPASS_RUNNER_KEY")
+    if not expected:
+        raise HTTPException(503, "Real Spark verification is disabled until DATAPASS_RUNNER_KEY is configured.")
+    if not x_datapass_runner_key or not hmac.compare_digest(x_datapass_runner_key, expected):
+        raise HTTPException(401, "Invalid Datapass runner key.")
+
 
 RUNTIMES = {
     "datapass-free": dict(label="Datapass Free Lab", executors=1, cores=2, memory_gb=1.0, partitions=4, scan=180, shuffle=90, rows_sec=180000, startup=80, credits_hour=0.0),
@@ -310,9 +349,11 @@ def compile_pyspark(code: str):
     if source is None: raise ValueError('Start with a source such as: df = spark.table("sales")')
     return source,ops,warnings
 
+real_spark = RealSparkOracle()
+
 app=FastAPI(
     title="Datapass Fake Spark Runtime",
-    version="0.1.0",
+    version="0.2.0",
     description="DuckDB executes bounded local data while a deterministic model simulates Spark stages, shuffles, partitions, spill, skew and fictional Datapass compute credits."
 )
 origins=[x.strip() for x in os.getenv("DATAPASS_CORS_ORIGINS","*").split(",") if x.strip()]
@@ -355,6 +396,61 @@ def execute(req: ExecuteRequest):
         raise HTTPException(422,str(e)) from e
     except Exception as e:
         raise HTTPException(400,f"Execution failed: {e}") from e
+
+@app.get("/v1/spark/verify/capabilities")
+def verify_capabilities():
+    return real_spark.capabilities()
+
+@app.post("/v1/spark/verify", status_code=202)
+def verify(req: VerifyRequest, _: None = Depends(require_runner_key)):
+    try:
+        return real_spark.dispatch(
+            code=req.code,
+            tables=[table.model_dump(mode="json") for table in req.tables],
+            collect_limit=req.collect_limit,
+        )
+    except ValueError as e:
+        raise HTTPException(422,str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(503,str(e)) from e
+
+@app.get("/v1/spark/jobs/{job_id}")
+def verify_job_status(job_id: str, _: None = Depends(require_runner_key)):
+    try:
+        return real_spark.status_job(job_id)
+    except ValueError as e:
+        raise HTTPException(404,str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(503,str(e)) from e
+
+@app.get("/v1/spark/jobs/{job_id}/result/{request_id}")
+def verify_job_result(job_id: str, request_id: str, _: None = Depends(require_runner_key)):
+    try:
+        return real_spark.result_job(job_id, request_id)
+    except ValueError as e:
+        raise HTTPException(404,str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(503,str(e)) from e
+
+# Legacy GitHub-run-id routes remain for existing Datapass clients while the
+# provider-neutral job_id contract rolls out.
+@app.get("/v1/spark/verify/{run_id}")
+def verify_status(run_id: int, _: None = Depends(require_runner_key)):
+    try:
+        return real_spark.status(run_id)
+    except ValueError as e:
+        raise HTTPException(404,str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(503,str(e)) from e
+
+@app.get("/v1/spark/verify/{run_id}/result/{request_id}")
+def verify_result(run_id: int, request_id: str, _: None = Depends(require_runner_key)):
+    try:
+        return real_spark.result(run_id, request_id)
+    except ValueError as e:
+        raise HTTPException(404,str(e)) from e
+    except RuntimeError as e:
+        raise HTTPException(503,str(e)) from e
 
 @app.post("/v1/spark/sql")
 def spark_sql(req: SqlRequest):
